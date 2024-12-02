@@ -299,7 +299,7 @@ class Decoder(nn.Module):
         # Collected lists, return Tensor
         return torch.stack(outputs, 1), torch.stack(sequences, 1)
 
-class EVRPTW_Model(nn.Module):
+class EVRP_Model(nn.Module):
     def __init__(self, config, env):
         super().__init__()
         self.embedding = Embedding(config.embed_dim)
@@ -322,7 +322,6 @@ class EVRPTW_Model(nn.Module):
     def forward(self, dict_x):
         x = self.embedding(dict_x)
         x = self.encoder(x)
-        breakpoint()
         x = self.decoder(env = self.env,
                          embedding = x)
         return x
@@ -338,7 +337,7 @@ def init_weights(module):
 if __name__ == "__main__":
     config = Config()
     env = None
-    model = EVRPTW_Model(config, env)
+    model = EVRP_Model(config, env)
     model.apply(init_weights)  # Apply weight initialization
 
     dict_x = {"deport": torch.rand(10, 1, 2), "nodes": torch.rand(10, 100, 2), "demand": torch.rand(10, 100)}
