@@ -9,14 +9,9 @@ import torch.optim as optim
 from problem.evrp import EVRP
 from configuration import get_options, Config
 
-# from nets.critic_network import CriticNetwork
 from model import EVRP_Model
-from train import train_epoch, validate, get_inner_model
-from reinforce_baselines import NoBaseline, ExponentialBaseline, CriticBaseline, RolloutBaseline, WarmupBaseline
-# from nets.attention_model import AttentionModel
-# from nets.pointer_network import PointerNetwork, CriticNetworkLSTM
-# from utils import torch_load_cpu, load_problem
-
+from train import train_epoch, validate
+from reinforce_baselines import NoBaseline, ExponentialBaseline, RolloutBaseline, WarmupBaseline
 
 def run(opts):
 
@@ -40,15 +35,11 @@ def run(opts):
     # Load data from load_path
     load_data = {}
     assert opts.load_path is None or opts.resume is None, "Only one of load path and resume can be given"
-    load_path = opts.load_path if opts.load_path is not None else opts.resume
-    if load_path is not None:
-        print('  [*] Loading data from {}'.format(load_path))
-        load_data = torch_load_cpu(load_path)
 
     # Initialize model
     config = Config()
-    model = EVRP_Model(config, env = None)
-    
+    model = EVRP_Model(config, problem = problem)
+
     # Initialize baseline
     if opts.baseline == 'exponential':
         baseline = ExponentialBaseline(opts.exp_beta)
@@ -85,7 +76,6 @@ def run(opts):
     if opts.eval_only:
         validate(model, val_dataset, opts)
     else:
-        breakpoint()
         for epoch in range(opts.epoch_start, opts.epoch_start + opts.n_epochs):
             train_epoch(
                 model,
@@ -100,4 +90,5 @@ def run(opts):
 
 
 if __name__ == "__main__":
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
     run(get_options())

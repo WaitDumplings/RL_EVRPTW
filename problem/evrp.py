@@ -3,8 +3,25 @@ import torch
 import os
 import pickle
 import random
+import numpy as np
 
 from .state_evrp import StateEVRP
+
+def count_routes_per_row(row):
+    """count routes"""
+    routes = 0
+    in_route = False
+
+    for value in row:
+        if value != 0 and not in_route:
+            # start a new route
+            in_route = True
+        elif value == 0 and in_route:
+            # complete a route
+            routes += 1
+            in_route = False
+
+    return routes
 
 
 class EVRP(object):
@@ -14,44 +31,64 @@ class EVRP(object):
     VEHICLE_CAPACITY = 1.0  # (w.l.o.g. vehicle capacity is 1, demands should be scaled)
 
     @staticmethod
-    def get_costs(dataset, pi):
-        batch_size, graph_size = dataset['demand'].size()
+    def get_costs(dataset, pi, rs_loss_coef = 0.01, dis_loss_coef = 0.99, tra_len_coef = 0.01, route_fee=5):
+        my_demand = torch.cat((torch.zeros(dataset['demand'].shape[0], dataset['loc'].shape[1] - dataset['demand'].shape[1], 1).to(pi.device), dataset['demand']),dim=1)
+        rs_idx = list(range(1, dataset['loc'].shape[1] - dataset['demand'].shape[1] + 1))
+        rs_idx_tensor = torch.tensor(rs_idx, device=pi.device)
+
+        batch_size, graph_size, _ = my_demand.size()
         # Check that tours are valid, i.e. contain 0 to n -1
         sorted_pi = pi.data.sort(1)[0]
+        counts = (sorted_pi.unsqueeze(-1) == rs_idx_tensor).view(batch_size, -1).sum(dim=1)
+        
+        # Traject length
+        reverse_data = pi.data.flip(dims=[1])
+        non_zero_idx = (reverse_data != 0).float().argmax(dim=1)  # find the first non zero
+        real_lengths = pi.data.size(1) - non_zero_idx
+
+        # number of routes
+        total_routes = torch.from_numpy(np.array([count_routes_per_row(row) for row in reverse_data])).to(pi.device)
 
         # Sorting it should give all zeros at front and then 1...n
-        assert (
-            torch.arange(1, graph_size + 1, out=pi.data.new()).view(1, -1).expand(batch_size, graph_size) ==
-            sorted_pi[:, -graph_size:]
-        ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
+        # assert (
+        #     torch.arange(1, graph_size + 1, out=pi.data.new()).view(1, -1).expand(batch_size, graph_size) ==
+        #     sorted_pi[:, -graph_size:]
+        # ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
 
         # Visiting depot resets capacity so we add demand = -capacity (we make sure it does not become negative)
         demand_with_depot = torch.cat(
             (
-                torch.full_like(dataset['demand'][:, :1], -CVRP.VEHICLE_CAPACITY),
-                dataset['demand']
+                torch.full_like(my_demand[:, :1], -EVRP.VEHICLE_CAPACITY),
+                my_demand
             ),
             1
-        )
-        d = demand_with_depot.gather(1, pi)
+        ).squeeze(-1)
 
-        used_cap = torch.zeros_like(dataset['demand'][:, 0])
+        d = demand_with_depot.gather(1, pi)
+        used_cap = torch.zeros_like(my_demand.squeeze(-1)[:, 0])
+
         for i in range(pi.size(1)):
-            used_cap += d[:, i]  # This will reset/make capacity negative if i == 0, e.g. depot visited
+            used_cap += d[:, i] # This will reset/make capacity negative if i == 0, e.g. depot visited
             # Cannot use less than 0
             used_cap[used_cap < 0] = 0
-            assert (used_cap <= CVRP.VEHICLE_CAPACITY + 1e-5).all(), "Used more than capacity"
+            if not (used_cap <= EVRP.VEHICLE_CAPACITY + 1e-5).all():
+                breakpoint()
+            assert (used_cap <= EVRP.VEHICLE_CAPACITY + 1e-5).all(), "Used more than capacity"
 
         # Gather dataset in order of tour
-        loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1)
+        loc_with_depot = torch.cat((dataset['depot'], dataset['loc']), 1)
         d = loc_with_depot.gather(1, pi[..., None].expand(*pi.size(), loc_with_depot.size(-1)))
 
         # Length is distance (L2-norm of difference) of each next location to its prev and of first and last to depot
-        return (
+        total_dis = (
             (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1)
-            + (d[:, 0] - dataset['depot']).norm(p=2, dim=1)  # Depot to first
-            + (d[:, -1] - dataset['depot']).norm(p=2, dim=1)  # Last to depot, will be 0 if depot is last
-        ), None
+            + (d[:, 0] - dataset['depot'].squeeze(1)).norm(p=2, dim=1)  # Depot to first
+            + (d[:, -1] - dataset['depot'].squeeze(1)).norm(p=2, dim=1)  # Last to depot, will be 0 if depot is last
+        )
+        rs_loss = rs_loss_coef * counts
+        dis_loss = dis_loss_coef * total_dis + real_lengths * tra_len_coef + route_fee * total_routes
+
+        return dis_loss + rs_loss, None
 
     @staticmethod
     def make_dataset(*args, **kwargs):
@@ -59,23 +96,23 @@ class EVRP(object):
 
     @staticmethod
     def make_state(*args, **kwargs):
-        return StateCVRP.initialize(*args, **kwargs)
+        return StateEVRP.initialize(*args, **kwargs)
 
 def make_instance(args):
-    depot, loc, demand, capacity, *args = args
+    depot, loc, demand, types, capacity, *args = args
     grid_size = 1
     if len(args) > 0:
         depot_types, customer_types, grid_size = args
     return {
         'loc': torch.tensor(loc, dtype=torch.float) / grid_size,
         'demand': torch.tensor(demand, dtype=torch.float) / capacity,
-        'depot': torch.tensor(depot, dtype=torch.float) / grid_size
+        'depot': torch.tensor(depot, dtype=torch.float) / grid_size,
+        'types': torch.tensor(types, dtype=torch.int64)
     }
 
 
 class VRPDataset(Dataset):
-    
-    def __init__(self, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
+    def __init__(self, filename=None, size=50, ratio = 0.9, num_samples=1000000, offset=0, distribution=None):
         super(VRPDataset, self).__init__()
 
         self.data_set = []
@@ -96,16 +133,15 @@ class VRPDataset(Dataset):
                 100: 50.
             }
 
+            self.customer_number = int(ratio * size)
+            self.rs_number = size - self.customer_number
             self.data = [
                 {
                     'loc': torch.FloatTensor(size, 2).uniform_(0, 1),
                     # Uniform 1 - 9, scaled by capacities
-                    'demand': (torch.FloatTensor(size).uniform_(0, 9).int() + 1).float() / CAPACITIES[size],
+                    'demand': (torch.FloatTensor(self.customer_number).uniform_(0, 9).int() + 1).float() / CAPACITIES[size],
                     'depot': torch.FloatTensor(2).uniform_(0, 1),
-                    'type': (lambda size: (
-                        torch.zeros(size, 1).scatter_(0, 
-                            torch.randperm(size)[:int(size * 0.1)].unsqueeze(1), 1)
-                    ))(size)
+                    'types': torch.cat((torch.zeros(self.rs_number,1), torch.ones(self.customer_number,1)))
                 }
                 for i in range(num_samples)
             ]

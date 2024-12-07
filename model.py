@@ -104,16 +104,23 @@ class MHA_Block(nn.Module):
 class Embedding(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
-        self.deport_embedding = nn.Linear(2, embed_dim)
+        self.depot_embedding = nn.Linear(2, embed_dim)
         self.nodes_embedding = nn.Linear(3, embed_dim)
+        self.rs_embedding = nn.Linear(2, embed_dim)
 
     def forward(self, x):
-        deport = self.deport_embedding(x['deport'])
-        if len(x['demand'].shape) != len(x['nodes'].shape):
+        self.customer_number = x['demand'].shape[1]
+        self.rs_number = x['loc'].shape[1] - self.customer_number
+        if len(x['depot'].shape) == 2:
+            x['depot'] = x['depot'].unsqueeze(-2)
+        depot = self.depot_embedding(x['depot'])
+        
+        if len(x['demand'].shape) != len(x['loc'].shape):
             x['demand'] = x['demand'].unsqueeze(-1)
-        nodes = self.nodes_embedding(torch.cat((x['nodes'], x['demand']), -1))
+        nodes = self.nodes_embedding(torch.cat((x['loc'][:,:self.customer_number,:], x['demand']), -1))
+        rs_nodes = self.rs_embedding(x['loc'][:,self.customer_number:,:])
 
-        return torch.cat((deport, nodes), dim=-2)
+        return torch.cat((depot, nodes, rs_nodes), dim=-2)
 
 # Attention Model with Configurable Layers
 class Encoder(nn.Module):
@@ -138,18 +145,18 @@ class Encoder(nn.Module):
 
     def forward(self, x, mask=None):
         for layer in self.attention_layers:
-            x = layer(x, mask=mask)
+            x = layer(x)
 
         return x
     
 class Decoder(nn.Module):
-    def __init__(self, input_dim, attention_dim, decoder_head, tanh_clipping, decode_type, env, mask_logits = True, temp = 1.0, normalization='batch', dropout=0.1):
+    def __init__(self, input_dim, attention_dim, decoder_head, tanh_clipping, decode_type, problem, mask_logits = True, temp = 1.0, normalization='batch', dropout=0.1):
         super().__init__()
         self.decoder_head = decoder_head
         self.attention_dim = attention_dim
-        self.norm_factor = 1 / math.sqrt(attention_dim)
+        self.norm_factor = 1 / math.sqrt(attention_dim//self.decoder_head)
         self.tanh_clipping = tanh_clipping
-        self.env = env
+        self.problem = problem
         self.mask_logits = mask_logits
         self.temp = temp
         self.decode_type = decode_type
@@ -157,11 +164,10 @@ class Decoder(nn.Module):
         self.time_embedding = nn.Linear(1, attention_dim // decoder_head, bias=False)
         self.context_project = nn.Linear(input_dim, attention_dim, bias=False)
         self.kvlogit_project = nn.Linear(input_dim, attention_dim * 3, bias=False)
-        self.project_step_context = nn.Linear(input_dim + 1, attention_dim, bias=False)
+        self.project_step_context = nn.Linear(input_dim + 2, attention_dim, bias=False)
         self.project_out = nn.Linear(attention_dim, attention_dim, bias=False)
 
     def _select_node(self, probs, mask):
-        breakpoint()
         assert (probs == probs).all(), "Probs should not contain any nans"
 
         if self.decode_type == "greedy":
@@ -182,8 +188,20 @@ class Decoder(nn.Module):
             assert False, "Unknown decode type"
         return selected
 
+    def _calc_log_likelihood(self, _log_p, a, mask):
+        # Get log_p corresponding to selected actions
+        log_p = _log_p.gather(2, a.unsqueeze(-1)).squeeze(-1)
 
-    def _one_to_many_logits(self, query, glimpse_K, glimpse_V, logit_K, mask):
+        # Optional: mask out actions irrelevant to objective so they do not get reinforced
+        if mask is not None:
+            log_p[mask] = 0
+
+        assert (log_p > -1000).data.all(), "Logprobs should not be -inf, check sampling procedure!"
+
+        # Calculate log_likelihood
+        return log_p.sum(1)
+
+    def _one_to_many_logits(self, query, glimpse_K, glimpse_V, logit_K, mask=None):
         batch_size, _, embed_dim = query.size()
         key_size = val_size = embed_dim // self.decoder_head
 
@@ -192,8 +210,9 @@ class Decoder(nn.Module):
 
         # Batch matrix multiplication to compute compatibilities (n_heads, batch_size, graph_size)
         compatibility = torch.matmul(glimpse_Q, glimpse_K.transpose(-2, -1)) / math.sqrt(glimpse_Q.size(-1))
-        if mask:
-            compatibility[mask[None, :, :, None, :].expand_as(compatibility)] = -math.inf
+
+        if mask is not None:
+            compatibility[mask[:, None, :, :].expand_as(compatibility)] = -math.inf
 
         # Batch matrix multiplication to compute heads (n_heads, batch_size, val_size)
         heads = torch.matmul(torch.softmax(compatibility, dim=-1), glimpse_V)
@@ -214,14 +233,15 @@ class Decoder(nn.Module):
         if self.tanh_clipping > 0:
             logits = torch.tanh(logits) * self.tanh_clipping
         if self.mask_logits and mask is not None:
-            logits[mask] = -math.inf
+            logits[mask.squeeze(1)] = -math.inf
 
         return logits, glimpse.squeeze(-2)
 
-    def _get_log_p(self, embeddings, context_node, glimpse_K, glimpse_V, logit_K, state, normalize=True):
+    def _get_log_p(self, embeddings, context_node, glimpse_K, glimpse_V, logit_K, state, normalize=True, time=None):
         batch_size = glimpse_K.shape[0]
-        current_node = state.get_current_node() if state else torch.zeros(batch_size, 1, dtype=torch.int64)
-        next_nodes = torch.cat((torch.gather(embeddings, 1, current_node.contiguous().view(batch_size, 1, 1).expand(batch_size, 1, embeddings.size(-1))).view(batch_size, 1, embeddings.size(-1)), self.problem.VEHICLE_CAPACITY - state.used_capacity[:, :, None]),-1)
+
+        current_node = state.get_current_node()
+        next_nodes = torch.cat((torch.gather(embeddings, 1, current_node.contiguous().view(batch_size, 1, 1).expand(batch_size, 1, embeddings.size(-1))).view(batch_size, 1, embeddings.size(-1)), self.problem.VEHICLE_CAPACITY - state.used_capacity[:, :, None], self.problem.BATTERY_CAPACITY - state.used_battery[:, :, None]),-1)
         # next_nodes = torch.cat((torch.gather(embeddings, 1, current_node.contiguous().view(batch_size, 1, 1).expand(batch_size, 1, embeddings.size(-1))).view(batch_size, 1, embeddings.size(-1)), torch.ones_like(current_node).unsqueeze(-1)),-1)
         
         # Compute query = context node embedding
@@ -229,28 +249,43 @@ class Decoder(nn.Module):
                 self.project_step_context(next_nodes)
 
         # Compute the mask
-        mask = state.get_mask() if state else None
+        mask = state.get_mask()
+
+        # For Debug
+        # mask2 = state.get_mask_()
+        # if not (mask == mask2).all():
+        #     breakpoint()
+        #     mask = state.get_mask()
+        #     mask2 = state.get_mask_()
+        # assert (mask == mask2).all(), "They are different"
 
         # time embedding (cur_time: bs, 1, 16)
-        current_time = state.get_current_time() if state is not None else torch.zeros(batch_size, 1).unsqueeze(1)
-        time_embedding = self.time_embedding(current_time).unsqueeze(1)
-        glimpse_K += time_embedding
-        glimpse_V += time_embedding
+        if time is not None:
+            current_time = state.get_current_time()
+            time_embedding = self.time_embedding(current_time)
+            time_embedding = time_embedding.unsqueeze(1)  # Add a new dimension for decoder_head
+            time_embedding = time_embedding.expand(time_embedding.shape[0], self.decoder_head, time_embedding.shape[2], time_embedding.shape[3])
+
+            glimpse_K += time_embedding
+            glimpse_V += time_embedding
 
         # Compute logits (unnormalized log_p)
         log_p, glimpse = self._one_to_many_logits(query, glimpse_K, glimpse_V, logit_K, mask)
 
         if normalize:
-            log_p = torch.log_softmax(log_p / self.temp, dim=-1)
+            log_p1 = torch.log_softmax(log_p / self.temp, dim=-1)
+        if torch.isnan(log_p1).any():
+            breakpoint()
+            mask = state.get_mask()
+        assert not torch.isnan(log_p1).any()
 
-        assert not torch.isnan(log_p).any()
+        return log_p1, mask
 
-        return log_p, mask
-
-    def forward(self, env, embedding, mask=None):
+    def forward(self, input, embedding, mask=None, return_pi=False):
         outputs = []
         sequences = []
 
+        state = self.problem.make_state(input)
         # avg hidden states to get graph embedding
         # BR1
         graph_embedding = embedding.mean(1)
@@ -266,41 +301,40 @@ class Decoder(nn.Module):
         glimps_v = glimps_v.view(batch_size, seq_len, self.decoder_head, hidden_dim//self.decoder_head).contiguous().transpose(1, 2)
         logits_k = logits_k.contiguous()
 
-        # Reset env
-        state = env.reset() if env is not None else None
-
         # Perform decoding steps
         i = 0
-        # while not state.all_finished():
-        while i < 2:
-            log_p, mask = self._get_log_p(embedding, fixed_context, glimps_k, glimps_v, logits_k, state)
+        self.temp = 1
 
+        while not state.all_finished():
+            # if self.decode_type == "greedy":
+            #     breakpoint()
+            log_p, mask = self._get_log_p(embedding, fixed_context, glimps_k, glimps_v, logits_k, state)
             # Select the indices of the next nodes in the sequences, result (batch_size) long
-            mask = torch.zeros_like(log_p.exp())
-            selected = self._select_node(log_p.exp(), mask)  # Squeeze out steps dimension
+            selected = self._select_node(log_p.exp(), mask[:,0,:])  # Squeeze out steps dimension
 
             state = state.update(selected)
 
-            # Now make log_p, selected desired output size by 'unshrinking'
-            if state.ids.size(0) < batch_size:
-                log_p_, selected_ = log_p, selected
-                log_p = log_p_.new_zeros(batch_size, *log_p_.size()[1:])
-                selected = selected_.new_zeros(batch_size)
-
-                log_p[state.ids[:, 0]] = log_p_
-                selected[state.ids[:, 0]] = selected_
-
             # Collect output of step
-            outputs.append(log_p[:, 0, :])
+            outputs.append(log_p)
             sequences.append(selected)
-
+            # print(torch.stack(sequences, 1)[0], state.used_capacity[0])
+            # print(torch.stack(sequences, 1)[1], state.used_capacity[1])
             i += 1
 
         # Collected lists, return Tensor
-        return torch.stack(outputs, 1), torch.stack(sequences, 1)
+        _log_p, pi = torch.stack(outputs, 1), torch.stack(sequences, 1)
+        cost, mask = self.problem.get_costs(input, pi)
+        # Log likelyhood is calculated within the model since returning it per action does not work well with
+        # DataParallel since sequences can be of different lengths
+        ll = self._calc_log_likelihood(_log_p, pi, mask)
 
+        if return_pi:
+            return cost, ll, pi
+
+        return cost, ll, None
+    
 class EVRP_Model(nn.Module):
-    def __init__(self, config, env):
+    def __init__(self, config, problem):
         super().__init__()
         self.embedding = Embedding(config.embed_dim)
         self.encoder = Encoder(block_num = config.block_num,
@@ -316,15 +350,16 @@ class EVRP_Model(nn.Module):
                                tanh_clipping = config.tanh_clipping,
                                temp = config.temp,
                                decode_type = config.decode_type,
-                               env = env)
-        self.env = env
+                               problem = problem)
+        self.problem = problem
     
-    def forward(self, dict_x):
+    def forward(self, dict_x, return_pi=False):
         x = self.embedding(dict_x)
         x = self.encoder(x)
-        x = self.decoder(env = self.env,
-                         embedding = x)
-        return x
+        cost, log_likelihood, pi = self.decoder(dict_x, x, return_pi=return_pi)
+        if not return_pi:
+            return cost, log_likelihood
+        return cost, log_likelihood, pi
 
 # Weight Initialization Function
 def init_weights(module):
@@ -332,17 +367,3 @@ def init_weights(module):
         nn.init.xavier_uniform_(module.weight)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
-
-# Example Usage
-if __name__ == "__main__":
-    config = Config()
-    env = None
-    model = EVRP_Model(config, env)
-    model.apply(init_weights)  # Apply weight initialization
-
-    dict_x = {"deport": torch.rand(10, 1, 2), "nodes": torch.rand(10, 100, 2), "demand": torch.rand(10, 100)}
-    model(dict_x)
-    # input_data = torch.rand(10, 15, 128)  # (batch_size, seq_len, input_dim)
-    # output = model(input_data)
-    # print(output.shape)  # Should be (10, 15, 128)
-

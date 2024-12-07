@@ -148,12 +148,12 @@ class RolloutBaseline(Baseline):
         self.problem = problem
         self.opts = opts
 
-        self._update_model(model, epoch)
+        self._update_model(model, epoch, device=self.opts.device)
 
-    def _update_model(self, model, epoch, dataset=None):
-        self.model = copy.deepcopy(model)
+    def _update_model(self, model, epoch, device=None, dataset=None):
+        self.model = copy.deepcopy(model).to(device)
+        
         # Always generate baseline dataset when updating model to prevent overfitting to the baseline dataset
-        breakpoint()
         if dataset is not None:
             if len(dataset) != self.opts.val_size:
                 print("Warning: not using saved baseline dataset since val_size does not match")

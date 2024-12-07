@@ -10,13 +10,13 @@ from torch.nn import DataParallel
 # from utils.log_utils import log_values
 # from utils import move_to
 
-def log_values(cost, grad_norms, epoch, batch_id, step,
+def log_values(cost, grad_norms, epoch, batch_id, cur_lr, step,
                log_likelihood, reinforce_loss, bl_loss, opts):
     avg_cost = cost.mean().item()
     grad_norms, grad_norms_clipped = grad_norms
 
     # Log values to screen
-    print('epoch: {}, train_batch_id: {}, avg_cost: {}'.format(epoch, batch_id, avg_cost))
+    print('epoch: {}, lr: {}, train_batch_id: {}, avg_cost: {}'.format(epoch, cur_lr, batch_id, avg_cost))
     print('grad_norm: {}, clipped: {}'.format(grad_norms[0], grad_norms_clipped[0]))
 
 
@@ -87,23 +87,23 @@ def train_epoch(model, optimizer, baseline, lr_scheduler, epoch, val_dataset, pr
         size=opts.graph_size, num_samples=opts.epoch_size, distribution=opts.data_distribution)
 
     # Generate new training data for each epoch
-    breakpoint()
     training_dataset = baseline.wrap_dataset(dataset)
     training_dataloader = DataLoader(training_dataset, batch_size=opts.batch_size, num_workers=1)
 
     # Put model in train mode!
     model.train()
+    model = model.to(opts.device)
     model.decode_type = "sampling"
-    # set_decode_type(model, "sampling")
-
+    
     for batch_id, batch in enumerate(tqdm(training_dataloader, disable=opts.no_progress_bar)):
-
+        cur_lr = lr_scheduler.get_last_lr()[0]
         train_batch(
             model,
             optimizer,
             baseline,
             epoch,
             batch_id,
+            cur_lr,
             step,
             batch,
             opts
@@ -141,24 +141,25 @@ def train_batch(
         baseline,
         epoch,
         batch_id,
+        cur_lr,
         step,
         batch,
         opts
 ):
     x, bl_val = baseline.unwrap_batch(batch)
     x = move_to(x, opts.device)
+
     bl_val = move_to(bl_val, opts.device) if bl_val is not None else None
 
     # Evaluate model, get costs and log probabilities
     cost, log_likelihood = model(x)
-
+    
     # Evaluate baseline, get baseline loss if any (only for critic)
     bl_val, bl_loss = baseline.eval(x, cost) if bl_val is None else (bl_val, 0)
-
     # Calculate loss
     reinforce_loss = ((cost - bl_val) * log_likelihood).mean()
     loss = reinforce_loss + bl_loss
-    print(loss.item())
+
     # Perform backward pass and optimization step
     optimizer.zero_grad()
     loss.backward()
@@ -168,5 +169,5 @@ def train_batch(
 
     # Logging
     if step % int(opts.log_step) == 0:
-        log_values(cost, grad_norms, epoch, batch_id, step,
+        log_values(cost, grad_norms, epoch, batch_id, cur_lr, step,
                    log_likelihood, reinforce_loss, bl_loss, opts)
