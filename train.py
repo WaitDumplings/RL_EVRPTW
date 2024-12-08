@@ -43,14 +43,18 @@ def validate(model, dataset, opts):
 def rollout(model, dataset, opts):
     # Put in greedy evaluation mode!
     # set_decode_type(model, "greedy")
-    model.decoder.decode_type = "greedy"
-    model.eval()
+    if isinstance(model, torch.nn.DataParallel):
+        model.module.decoder.decode_type = 'greedy'
+    else:
+        model.decoder.decode_type = 'greedy'
 
+    model.eval()
+    
     def eval_model_bat(bat):
         with torch.no_grad():
             cost, _ = model(move_to(bat, opts.device))
         return cost.data.cpu()
-
+    
     return torch.cat([
         eval_model_bat(bat)
         for bat

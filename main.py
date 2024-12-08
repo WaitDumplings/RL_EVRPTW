@@ -40,6 +40,9 @@ def run(opts):
     config = Config()
     model = EVRP_Model(config, problem = problem)
 
+    if opts.use_cuda and torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+
     # Initialize baseline
     if opts.baseline == 'exponential':
         baseline = ExponentialBaseline(opts.exp_beta)
@@ -48,7 +51,6 @@ def run(opts):
     else:
         assert opts.baseline is None, "Unknown baseline: {}".format(opts.baseline)
         baseline = NoBaseline()
-
     if opts.bl_warmup_epochs > 0:
         baseline = WarmupBaseline(baseline, opts.bl_warmup_epochs, warmup_exp_beta=opts.exp_beta)
 
@@ -90,5 +92,5 @@ def run(opts):
 
 
 if __name__ == "__main__":
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
     run(get_options())

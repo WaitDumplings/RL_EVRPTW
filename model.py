@@ -284,6 +284,7 @@ class Decoder(nn.Module):
     def forward(self, input, embedding, mask=None, return_pi=False):
         outputs = []
         sequences = []
+        chg_energy_list = []
 
         state = self.problem.make_state(input)
         # avg hidden states to get graph embedding
@@ -303,27 +304,30 @@ class Decoder(nn.Module):
 
         # Perform decoding steps
         i = 0
-        self.temp = 1
-
         while not state.all_finished():
             # if self.decode_type == "greedy":
             #     breakpoint()
             log_p, mask = self._get_log_p(embedding, fixed_context, glimps_k, glimps_v, logits_k, state)
             # Select the indices of the next nodes in the sequences, result (batch_size) long
             selected = self._select_node(log_p.exp(), mask[:,0,:])  # Squeeze out steps dimension
-
+            
             state = state.update(selected)
+            energy = state.chrg_battery
+            # energy_mask = (selected <= (input['loc'].shape[1] - input['demand'].shape[1])) & (selected > 0)
 
             # Collect output of step
             outputs.append(log_p)
             sequences.append(selected)
+            chg_energy_list.append(energy)
             # print(torch.stack(sequences, 1)[0], state.used_capacity[0])
             # print(torch.stack(sequences, 1)[1], state.used_capacity[1])
             i += 1
 
         # Collected lists, return Tensor
         _log_p, pi = torch.stack(outputs, 1), torch.stack(sequences, 1)
-        cost, mask = self.problem.get_costs(input, pi)
+        remain_energy = torch.sum(torch.stack(chg_energy_list, 1),dim=1)
+
+        cost, mask = self.problem.get_costs(input, remain_energy, pi)
         # Log likelyhood is calculated within the model since returning it per action does not work well with
         # DataParallel since sequences can be of different lengths
         ll = self._calc_log_likelihood(_log_p, pi, mask)
